@@ -14,6 +14,14 @@ import numpy as np
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB limit
 
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "POST, GET, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return response
+
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_landmarker.task")
 
 
@@ -83,8 +91,33 @@ def symmetrize_face(img: Image.Image, max_strength: float = 0.12) -> Image.Image
     - Blends at 10-15% toward the symmetric version (never more)
     - Only touches the face region, leaves background untouched
     """
-    arr = np.array(img)
+    try:
+        return _symmetrize_face_impl(img, max_strength)
+    except Exception:
+        return img  # any failure in face processing → return original
+
+
+def _symmetrize_face_impl(img: Image.Image, max_strength: float) -> Image.Image:
+    # Limit image dimensions for mediapipe stability (process at max 2048px,
+    # then apply the correction back at original resolution)
+    MAX_DIM = 2048
+    orig_w, orig_h = img.size
+    scale = 1.0
+    if max(orig_w, orig_h) > MAX_DIM:
+        scale = MAX_DIM / max(orig_w, orig_h)
+
+    if scale < 1.0:
+        work_img = img.resize(
+            (int(orig_w * scale), int(orig_h * scale)), Image.LANCZOS
+        )
+    else:
+        work_img = img
+
+    arr = np.ascontiguousarray(np.array(work_img, dtype=np.uint8))
     h, w = arr.shape[:2]
+
+    if h < 64 or w < 64:
+        return img  # image too small for face detection
 
     options = vision.FaceLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=MODEL_PATH),
@@ -179,10 +212,13 @@ def symmetrize_face(img: Image.Image, max_strength: float = 0.12) -> Image.Image
 
     # Feathered mask so the edit blends smoothly into the background
     mask = np.zeros((crop_h, crop_w), dtype=np.float32)
-    feather = min(pad_x, pad_y, 20)
-    mask[feather:-feather, feather:-feather] = 1.0
-    if feather > 0:
-        mask = cv2.GaussianBlur(mask, (feather * 2 + 1, feather * 2 + 1), feather / 2)
+    feather = max(1, min(pad_x, pad_y, 20))
+    if crop_h > feather * 2 and crop_w > feather * 2:
+        mask[feather:-feather, feather:-feather] = 1.0
+        ksize = feather * 2 + 1
+        mask = cv2.GaussianBlur(mask, (ksize, ksize), feather / 2)
+    else:
+        mask[:, :] = 1.0  # face crop too small to feather, just apply directly
     mask = mask[:, :, np.newaxis]
 
     # Composite
@@ -192,7 +228,23 @@ def symmetrize_face(img: Image.Image, max_strength: float = 0.12) -> Image.Image
     )
     arr[y1:y2, x1:x2] = np.clip(blended, 0, 255).astype(np.uint8)
 
-    return Image.fromarray(arr)
+    result_work = Image.fromarray(arr)
+
+    if scale < 1.0:
+        # We worked at reduced resolution — compute a diff and apply it at full res
+        orig_arr = np.array(img, dtype=np.float64)
+        work_up = np.array(
+            result_work.resize((orig_w, orig_h), Image.LANCZOS), dtype=np.float64
+        )
+        work_orig_up = np.array(
+            work_img.resize((orig_w, orig_h), Image.LANCZOS), dtype=np.float64
+        )
+        # The correction delta, upscaled
+        delta = work_up - work_orig_up
+        final = np.clip(orig_arr + delta, 0, 255).astype(np.uint8)
+        return Image.fromarray(final)
+
+    return result_work
 
 
 def scramble(img: Image.Image) -> Image.Image:
