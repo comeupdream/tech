@@ -47,6 +47,27 @@
   .info strong { color: #ccc; }
   #fileInput { display: none; }
   canvas { display: none; }
+
+  /* Results panel */
+  .results { margin-top: 24px; width: 100%; max-width: 500px; display: none; }
+  .results h2 { font-size: 18px; margin-bottom: 12px; }
+  .stats {
+    background: #1a1a1a; border-radius: 12px; padding: 16px;
+    margin-bottom: 16px; font-size: 13px; line-height: 1.8;
+  }
+  .stats .label { color: #888; }
+  .stats .value { color: #7c6ef0; font-weight: 600; }
+  .stats .check { color: #4ade80; }
+  .stats .skip { color: #666; }
+  .compare { display: flex; gap: 12px; margin-bottom: 12px; }
+  .compare > div { flex: 1; text-align: center; }
+  .compare canvas {
+    display: block !important;
+    width: 100%; border-radius: 8px;
+    border: 1px solid #333;
+  }
+  .compare label { font-size: 12px; color: #888; display: block; margin-bottom: 4px; }
+  .diff-note { font-size: 11px; color: #666; text-align: center; margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -65,6 +86,27 @@
     <button class="btn" id="scrambleBtn">Scramble &amp; Download</button>
     <div class="status" id="status"></div>
   </div>
+
+  <div class="results" id="results">
+    <h2>Results</h2>
+    <div class="stats" id="statsPanel"></div>
+    <div class="compare">
+      <div>
+        <label>Before</label>
+        <canvas id="beforeCanvas"></canvas>
+      </div>
+      <div>
+        <label>After</label>
+        <canvas id="afterCanvas"></canvas>
+      </div>
+      <div>
+        <label>Difference (10x boost)</label>
+        <canvas id="diffCanvas"></canvas>
+      </div>
+    </div>
+    <p class="diff-note">The difference view amplifies changes 10x so you can see them. In reality they are invisible to the eye.</p>
+  </div>
+
   <canvas id="canvas"></canvas>
 
   <div class="info">
@@ -90,10 +132,18 @@
   const statusEl    = document.getElementById("status");
   const canvas      = document.getElementById("canvas");
   const ctx         = canvas.getContext("2d", { willReadFrequently: true });
+  const resultsDiv  = document.getElementById("results");
+  const statsPanel  = document.getElementById("statsPanel");
+  const beforeCanvas = document.getElementById("beforeCanvas");
+  const afterCanvas  = document.getElementById("afterCanvas");
+  const diffCanvas   = document.getElementById("diffCanvas");
 
   let selectedFile = null;
   let faceLandmarker = null;
   let faceLandmarkerFailed = false;
+
+  // Track what we did for the stats panel
+  let stats = {};
 
   // Load MediaPipe face landmarker in background
   async function initFaceLandmarker() {
@@ -131,13 +181,16 @@
     selectedFile = file;
     previewImg.src = URL.createObjectURL(file);
     previewArea.style.display = "block";
+    resultsDiv.style.display = "none";
     statusEl.textContent = "Selected: " + file.name + " (" + (file.size / 1024).toFixed(0) + " KB)";
   }
 
   scrambleBtn.addEventListener("click", async () => {
     if (!selectedFile) return;
     scrambleBtn.disabled = true;
+    resultsDiv.style.display = "none";
     statusEl.textContent = "Loading image...";
+    stats = { colorShift: [], edgePixels: 0, scatteredPixels: 0, symmetry: "skipped", symmetryStrength: 0 };
 
     try {
       const img = await loadImage(selectedFile);
@@ -147,9 +200,11 @@
       // Step 1: Draw to canvas (strips all metadata automatically)
       ctx.drawImage(img, 0, 0);
       statusEl.textContent = "Scrambling pixels...";
-
-      // Small delay so the status text renders
       await sleep(50);
+
+      // Save original pixels for comparison
+      const originalData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const origCopy = new Uint8ClampedArray(originalData.data);
 
       let imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
@@ -170,7 +225,36 @@
 
       // Step 6: Export as JPEG with random quality
       const quality = 0.88 + Math.random() * 0.07; // 88-95%
+      stats.jpegQuality = Math.round(quality * 100);
+
+      // Count changed pixels for stats
+      const afterData = imageData.data;
+      let changedPixels = 0;
+      let totalDiff = 0;
+      for (let i = 0; i < origCopy.length; i += 4) {
+        const dr = Math.abs(afterData[i] - origCopy[i]);
+        const dg = Math.abs(afterData[i+1] - origCopy[i+1]);
+        const db = Math.abs(afterData[i+2] - origCopy[i+2]);
+        if (dr > 0 || dg > 0 || db > 0) {
+          changedPixels++;
+          totalDiff += dr + dg + db;
+        }
+      }
+      const totalPixels = canvas.width * canvas.height;
+      stats.changedPixels = changedPixels;
+      stats.totalPixels = totalPixels;
+      stats.avgDiff = totalDiff / (changedPixels * 3 || 1);
+
+      // Build comparison canvases
+      showComparison(origCopy, afterData, canvas.width, canvas.height);
+
       canvas.toBlob(blob => {
+        stats.originalSize = selectedFile.size;
+        stats.newSize = blob.size;
+
+        // Show stats
+        showStats();
+
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
@@ -179,7 +263,7 @@
         a.click();
         a.remove();
         URL.revokeObjectURL(url);
-        statusEl.textContent = "Done — file downloaded!";
+        statusEl.textContent = "Done — file downloaded! Scroll down to see proof of changes.";
         scrambleBtn.disabled = false;
       }, "image/jpeg", quality);
     } catch (err) {
@@ -187,6 +271,71 @@
       scrambleBtn.disabled = false;
     }
   });
+
+  function showStats() {
+    const pct = ((stats.changedPixels / stats.totalPixels) * 100).toFixed(1);
+    const symLine = stats.symmetry === "applied"
+      ? '<span class="check">Applied (' + stats.symmetryStrength + '% strength)</span>'
+      : stats.symmetry === "not needed"
+      ? '<span class="skip">Not needed (face already symmetric)</span>'
+      : stats.symmetry === "no face"
+      ? '<span class="skip">No face detected</span>'
+      : '<span class="skip">Model loading (scramble still applied)</span>';
+
+    statsPanel.innerHTML =
+      '<span class="label">Metadata:</span> <span class="check">Stripped (EXIF, IPTC, XMP, ICC all removed)</span><br>' +
+      '<span class="label">Face symmetry:</span> ' + symLine + '<br>' +
+      '<span class="label">Color shift:</span> <span class="value">R ' + stats.colorShift[0] + '% &nbsp; G ' + stats.colorShift[1] + '% &nbsp; B ' + stats.colorShift[2] + '%</span><br>' +
+      '<span class="label">Pixels modified:</span> <span class="value">' + stats.changedPixels.toLocaleString() + ' / ' + stats.totalPixels.toLocaleString() + ' (' + pct + '%)</span><br>' +
+      '<span class="label">Avg change per pixel:</span> <span class="value">' + stats.avgDiff.toFixed(1) + ' / 255 levels</span><br>' +
+      '<span class="label">JPEG quality:</span> <span class="value">' + stats.jpegQuality + '%</span><br>' +
+      '<span class="label">File size:</span> <span class="value">' + (stats.originalSize/1024).toFixed(0) + ' KB &rarr; ' + (stats.newSize/1024).toFixed(0) + ' KB</span>';
+
+    resultsDiv.style.display = "block";
+  }
+
+  function showComparison(origPixels, afterPixels, w, h) {
+    // Scale down for display (max 160px wide per panel)
+    const scale = Math.min(1, 160 / w);
+    const dw = Math.round(w * scale);
+    const dh = Math.round(h * scale);
+
+    // Before
+    beforeCanvas.width = dw; beforeCanvas.height = dh;
+    const bCtx = beforeCanvas.getContext("2d");
+    const tmpCanvas = document.createElement("canvas");
+    tmpCanvas.width = w; tmpCanvas.height = h;
+    const tmpCtx = tmpCanvas.getContext("2d");
+    const origID = new ImageData(new Uint8ClampedArray(origPixels), w, h);
+    tmpCtx.putImageData(origID, 0, 0);
+    bCtx.drawImage(tmpCanvas, 0, 0, dw, dh);
+
+    // After
+    afterCanvas.width = dw; afterCanvas.height = dh;
+    const aCtx = afterCanvas.getContext("2d");
+    const afterID = new ImageData(new Uint8ClampedArray(afterPixels), w, h);
+    tmpCtx.putImageData(afterID, 0, 0);
+    aCtx.drawImage(tmpCanvas, 0, 0, dw, dh);
+
+    // Difference (amplified 10x)
+    diffCanvas.width = dw; diffCanvas.height = dh;
+    const dCtx = diffCanvas.getContext("2d");
+    const diffData = new ImageData(dw, dh);
+    const bData = bCtx.getImageData(0, 0, dw, dh).data;
+    const aData = aCtx.getImageData(0, 0, dw, dh).data;
+    for (let i = 0; i < bData.length; i += 4) {
+      const dr = Math.abs(aData[i] - bData[i]);
+      const dg = Math.abs(aData[i+1] - bData[i+1]);
+      const db = Math.abs(aData[i+2] - bData[i+2]);
+      // Amplify 10x and show as hot colors
+      const boost = 10;
+      diffData.data[i]   = Math.min(255, dr * boost);
+      diffData.data[i+1] = Math.min(255, dg * boost);
+      diffData.data[i+2] = Math.min(255, db * boost);
+      diffData.data[i+3] = 255;
+    }
+    dCtx.putImageData(diffData, 0, 0);
+  }
 
   // --- Processing functions ---
 
@@ -203,11 +352,13 @@
 
   function shiftColors(imageData) {
     const d = imageData.data;
-    const factors = [
-      1 + (Math.random() * 0.03 - 0.015),  // R: +-1.5%
-      1 + (Math.random() * 0.03 - 0.015),  // G
-      1 + (Math.random() * 0.03 - 0.015),  // B
+    const shifts = [
+      (Math.random() * 0.03 - 0.015),
+      (Math.random() * 0.03 - 0.015),
+      (Math.random() * 0.03 - 0.015),
     ];
+    const factors = shifts.map(s => 1 + s);
+    stats.colorShift = shifts.map(s => (s > 0 ? "+" : "") + (s * 100).toFixed(2));
     for (let i = 0; i < d.length; i += 4) {
       d[i]     = Math.min(255, Math.max(0, Math.round(d[i]     * factors[0])));
       d[i + 1] = Math.min(255, Math.max(0, Math.round(d[i + 1] * factors[1])));
@@ -217,6 +368,7 @@
 
   function addEdgeNoise(imageData, border = 6, strength = 8) {
     const { data, width, height } = imageData;
+    let count = 0;
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
         if (y < border || y >= height - border || x < border || x >= width - border) {
@@ -225,9 +377,11 @@
             const noise = Math.floor(Math.random() * (strength * 2 + 1)) - strength;
             data[i + c] = Math.min(255, Math.max(0, data[i + c] + noise));
           }
+          count++;
         }
       }
     }
+    stats.edgePixels = count;
   }
 
   function scatterPixels(imageData, count = 30) {
@@ -239,6 +393,7 @@
       const c = Math.floor(Math.random() * 3);
       data[i + c] = Math.min(255, Math.max(0, data[i + c] + (Math.random() < 0.5 ? -1 : 1)));
     }
+    stats.scatteredPixels = count;
   }
 
   // --- Face symmetry ---
@@ -264,22 +419,26 @@
   }
 
   async function symmetrizeFace(imageData) {
-    if (!faceLandmarker || faceLandmarkerFailed) return imageData;
+    if (!faceLandmarker || faceLandmarkerFailed) {
+      stats.symmetry = "skipped";
+      return imageData;
+    }
 
     statusEl.textContent = "Checking face symmetry...";
     await sleep(50);
 
     try {
-      // Put current imageData on canvas so we can pass it to MediaPipe
       ctx.putImageData(imageData, 0, 0);
       const results = faceLandmarker.detect(canvas);
 
-      if (!results.faceLandmarks || results.faceLandmarks.length === 0) return imageData;
+      if (!results.faceLandmarks || results.faceLandmarks.length === 0) {
+        stats.symmetry = "no face";
+        return imageData;
+      }
 
       const landmarks = results.faceLandmarks[0];
       const w = imageData.width, h = imageData.height;
 
-      // Bounding box from landmarks
       let xMin = w, yMin = h, xMax = 0, yMax = 0;
       for (const lm of landmarks) {
         const px = lm.x * w, py = lm.y * h;
@@ -295,47 +454,44 @@
       const x2 = Math.min(w, Math.ceil(xMax) + padX);
       const y2 = Math.min(h, Math.ceil(yMax) + padY);
 
-      // Midline from nose tip (index 6), forehead (10), chin (152)
       const noseTip  = landmarks[6];
       const forehead = landmarks[10];
       const chin     = landmarks[152];
       const midX = ((noseTip.x + forehead.x + chin.x) / 3) * w;
       const midCol = Math.max(x1 + 1, Math.min(x2 - 1, Math.round(midX)));
 
-      // Measure asymmetry
       const asym = measureAsymmetry(imageData, x1, y1, x2, y2);
-      if (asym < 0.03) return imageData; // already symmetric enough
+      if (asym < 0.03) {
+        stats.symmetry = "not needed";
+        return imageData;
+      }
 
       const maxStrength = 0.12;
       const strength = Math.min(maxStrength, asym * 1.5);
+      stats.symmetry = "applied";
+      stats.symmetryStrength = (strength * 100).toFixed(1);
+
       const data = imageData.data;
       const cropW = x2 - x1;
       const cropH = y2 - y1;
       const localMid = midCol - x1;
       const feather = Math.max(1, Math.min(padX, padY, 20));
 
-      statusEl.textContent = "Applying symmetry correction (" + (strength * 100).toFixed(0) + "%)...";
+      statusEl.textContent = "Applying symmetry correction (" + stats.symmetryStrength + "%)...";
       await sleep(50);
 
-      // Blend each pixel with its mirror across the midline
       for (let row = 0; row < cropH; row++) {
-        // Feather factor (fade out near edges of crop)
         const fy = row < feather ? row / feather
                  : row >= cropH - feather ? (cropH - 1 - row) / feather : 1;
-
         for (let col = 0; col < cropW; col++) {
           const fx = col < feather ? col / feather
                    : col >= cropW - feather ? (cropW - 1 - col) / feather : 1;
           const fade = fx * fy;
           const s = strength * fade;
-
-          // Mirror column across midline
           const mirrorCol = 2 * localMid - col;
           if (mirrorCol < 0 || mirrorCol >= cropW) continue;
-
           const iOrig   = ((y1 + row) * w + (x1 + col)) * 4;
           const iMirror = ((y1 + row) * w + (x1 + mirrorCol)) * 4;
-
           for (let c = 0; c < 3; c++) {
             data[iOrig + c] = Math.round(data[iOrig + c] * (1 - s) + data[iMirror + c] * s);
           }
@@ -345,6 +501,7 @@
       return imageData;
     } catch (e) {
       console.warn("Face symmetry failed, skipping:", e);
+      stats.symmetry = "skipped";
       return imageData;
     }
   }
