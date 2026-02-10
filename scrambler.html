@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Photo Scrambler</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0f0f0f;
+    color: #e0e0e0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 40px 20px;
+  }
+  h1 { font-size: 28px; margin-bottom: 8px; }
+  .subtitle { color: #888; margin-bottom: 32px; font-size: 14px; }
+  .drop-zone {
+    width: 100%; max-width: 500px;
+    border: 2px dashed #444; border-radius: 16px;
+    padding: 60px 20px; text-align: center; cursor: pointer;
+    transition: border-color 0.2s, background 0.2s;
+  }
+  .drop-zone:hover, .drop-zone.dragover {
+    border-color: #7c6ef0; background: rgba(124,110,240,0.05);
+  }
+  .drop-zone p { font-size: 16px; margin-bottom: 8px; }
+  .drop-zone small { color: #666; }
+  .preview-area { margin-top: 24px; width: 100%; max-width: 500px; }
+  .preview-area img { width: 100%; border-radius: 12px; margin-top: 12px; }
+  .btn {
+    display: inline-block; margin-top: 16px; padding: 12px 28px;
+    background: #7c6ef0; color: #fff; border: none; border-radius: 8px;
+    font-size: 15px; cursor: pointer; transition: background 0.2s;
+  }
+  .btn:hover { background: #6558d4; }
+  .btn:disabled { background: #333; cursor: not-allowed; }
+  .status { margin-top: 12px; font-size: 13px; color: #888; min-height: 20px; }
+  .info {
+    margin-top: 40px; max-width: 500px; background: #1a1a1a;
+    border-radius: 12px; padding: 20px; font-size: 13px;
+    line-height: 1.6; color: #999;
+  }
+  .info strong { color: #ccc; }
+  #fileInput { display: none; }
+  canvas { display: none; }
+</style>
+</head>
+<body>
+  <h1>Photo Scrambler</h1>
+  <p class="subtitle">Strip metadata &amp; subtly alter pixels &mdash; runs entirely in your browser</p>
+
+  <div class="drop-zone" id="dropZone">
+    <p>Drop a photo here or click to browse</p>
+    <small>JPG, PNG, WEBP &mdash; no size limit, nothing leaves your computer</small>
+  </div>
+  <input type="file" id="fileInput" accept="image/*" multiple>
+
+  <div class="preview-area" id="previewArea" style="display:none;">
+    <strong>Original:</strong>
+    <img id="previewImg" alt="preview">
+    <button class="btn" id="scrambleBtn">Scramble &amp; Download</button>
+    <div class="status" id="status"></div>
+  </div>
+  <canvas id="canvas"></canvas>
+
+  <div class="info">
+    <strong>What this does:</strong><br>
+    1. Subtle facial symmetry correction (only if needed, 10-15% max)<br>
+    2. Strips all EXIF, IPTC, XMP &amp; ICC metadata<br>
+    3. Shifts color channels by a random 1-2%<br>
+    4. Adds subtle pixel noise around the image edges<br>
+    5. Scatters random interior pixels by &plusmn;1<br>
+    6. Re-encodes as JPEG with randomized quality<br><br>
+    Everything runs locally in your browser. No server, no uploads, your photos never leave your machine.
+  </div>
+
+<script type="module">
+  import { FaceLandmarker, FilesetResolver }
+    from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22-rc.20250304/+esm";
+
+  const dropZone  = document.getElementById("dropZone");
+  const fileInput = document.getElementById("fileInput");
+  const previewArea = document.getElementById("previewArea");
+  const previewImg  = document.getElementById("previewImg");
+  const scrambleBtn = document.getElementById("scrambleBtn");
+  const statusEl    = document.getElementById("status");
+  const canvas      = document.getElementById("canvas");
+  const ctx         = canvas.getContext("2d", { willReadFrequently: true });
+
+  let selectedFile = null;
+  let faceLandmarker = null;
+  let faceLandmarkerFailed = false;
+
+  // Load MediaPipe face landmarker in background
+  async function initFaceLandmarker() {
+    try {
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22-rc.20250304/wasm"
+      );
+      faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task",
+          delegate: "CPU"
+        },
+        runningMode: "IMAGE",
+        numFaces: 1,
+      });
+    } catch (e) {
+      console.warn("Face landmarker failed to load, symmetry correction disabled:", e);
+      faceLandmarkerFailed = true;
+    }
+  }
+  initFaceLandmarker();
+
+  // --- UI wiring ---
+  dropZone.addEventListener("click", () => fileInput.click());
+  dropZone.addEventListener("dragover", e => { e.preventDefault(); dropZone.classList.add("dragover"); });
+  dropZone.addEventListener("dragleave", () => dropZone.classList.remove("dragover"));
+  dropZone.addEventListener("drop", e => {
+    e.preventDefault(); dropZone.classList.remove("dragover");
+    if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+  });
+  fileInput.addEventListener("change", () => { if (fileInput.files.length) handleFile(fileInput.files[0]); });
+
+  function handleFile(file) {
+    if (!file.type.startsWith("image/")) { alert("Please select an image file."); return; }
+    selectedFile = file;
+    previewImg.src = URL.createObjectURL(file);
+    previewArea.style.display = "block";
+    statusEl.textContent = "Selected: " + file.name + " (" + (file.size / 1024).toFixed(0) + " KB)";
+  }
+
+  scrambleBtn.addEventListener("click", async () => {
+    if (!selectedFile) return;
+    scrambleBtn.disabled = true;
+    statusEl.textContent = "Loading image...";
+
+    try {
+      const img = await loadImage(selectedFile);
+      canvas.width  = img.width;
+      canvas.height = img.height;
+
+      // Step 1: Draw to canvas (strips all metadata automatically)
+      ctx.drawImage(img, 0, 0);
+      statusEl.textContent = "Scrambling pixels...";
+
+      // Small delay so the status text renders
+      await sleep(50);
+
+      let imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+      // Step 2: Face symmetry (if model loaded)
+      imageData = await symmetrizeFace(imageData);
+
+      // Step 3: Color shift (1-2% per channel)
+      shiftColors(imageData);
+
+      // Step 4: Edge noise
+      addEdgeNoise(imageData);
+
+      // Step 5: Scatter random pixels
+      scatterPixels(imageData);
+
+      // Put processed data back
+      ctx.putImageData(imageData, 0, 0);
+
+      // Step 6: Export as JPEG with random quality
+      const quality = 0.88 + Math.random() * 0.07; // 88-95%
+      canvas.toBlob(blob => {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "scrambled_" + Math.random().toString(36).slice(2, 10) + ".jpg";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        statusEl.textContent = "Done — file downloaded!";
+        scrambleBtn.disabled = false;
+      }, "image/jpeg", quality);
+    } catch (err) {
+      statusEl.textContent = "Error: " + err.message;
+      scrambleBtn.disabled = false;
+    }
+  });
+
+  // --- Processing functions ---
+
+  function loadImage(file) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error("Failed to load image"));
+      img.src = URL.createObjectURL(file);
+    });
+  }
+
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  function shiftColors(imageData) {
+    const d = imageData.data;
+    const factors = [
+      1 + (Math.random() * 0.03 - 0.015),  // R: +-1.5%
+      1 + (Math.random() * 0.03 - 0.015),  // G
+      1 + (Math.random() * 0.03 - 0.015),  // B
+    ];
+    for (let i = 0; i < d.length; i += 4) {
+      d[i]     = Math.min(255, Math.max(0, Math.round(d[i]     * factors[0])));
+      d[i + 1] = Math.min(255, Math.max(0, Math.round(d[i + 1] * factors[1])));
+      d[i + 2] = Math.min(255, Math.max(0, Math.round(d[i + 2] * factors[2])));
+    }
+  }
+
+  function addEdgeNoise(imageData, border = 6, strength = 8) {
+    const { data, width, height } = imageData;
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        if (y < border || y >= height - border || x < border || x >= width - border) {
+          const i = (y * width + x) * 4;
+          for (let c = 0; c < 3; c++) {
+            const noise = Math.floor(Math.random() * (strength * 2 + 1)) - strength;
+            data[i + c] = Math.min(255, Math.max(0, data[i + c] + noise));
+          }
+        }
+      }
+    }
+  }
+
+  function scatterPixels(imageData, count = 30) {
+    const { data, width, height } = imageData;
+    for (let n = 0; n < count; n++) {
+      const x = 1 + Math.floor(Math.random() * (width - 2));
+      const y = 1 + Math.floor(Math.random() * (height - 2));
+      const i = (y * width + x) * 4;
+      const c = Math.floor(Math.random() * 3);
+      data[i + c] = Math.min(255, Math.max(0, data[i + c] + (Math.random() < 0.5 ? -1 : 1)));
+    }
+  }
+
+  // --- Face symmetry ---
+
+  function measureAsymmetry(imageData, x1, y1, x2, y2) {
+    const { data, width } = imageData;
+    const cropW = x2 - x1;
+    const cropH = y2 - y1;
+    const mid = Math.floor(cropW / 2);
+    let totalDiff = 0, count = 0;
+    for (let row = 0; row < cropH; row++) {
+      for (let col = 0; col < mid; col++) {
+        const mirrorCol = cropW - 1 - col;
+        const iL = ((y1 + row) * width + (x1 + col)) * 4;
+        const iR = ((y1 + row) * width + (x1 + mirrorCol)) * 4;
+        for (let c = 0; c < 3; c++) {
+          totalDiff += Math.abs(data[iL + c] - data[iR + c]);
+          count++;
+        }
+      }
+    }
+    return count > 0 ? totalDiff / count / 255 : 0;
+  }
+
+  async function symmetrizeFace(imageData) {
+    if (!faceLandmarker || faceLandmarkerFailed) return imageData;
+
+    statusEl.textContent = "Checking face symmetry...";
+    await sleep(50);
+
+    try {
+      // Put current imageData on canvas so we can pass it to MediaPipe
+      ctx.putImageData(imageData, 0, 0);
+      const results = faceLandmarker.detect(canvas);
+
+      if (!results.faceLandmarks || results.faceLandmarks.length === 0) return imageData;
+
+      const landmarks = results.faceLandmarks[0];
+      const w = imageData.width, h = imageData.height;
+
+      // Bounding box from landmarks
+      let xMin = w, yMin = h, xMax = 0, yMax = 0;
+      for (const lm of landmarks) {
+        const px = lm.x * w, py = lm.y * h;
+        if (px < xMin) xMin = px;
+        if (px > xMax) xMax = px;
+        if (py < yMin) yMin = py;
+        if (py > yMax) yMax = py;
+      }
+      const padX = Math.floor((xMax - xMin) * 0.1);
+      const padY = Math.floor((yMax - yMin) * 0.1);
+      const x1 = Math.max(0, Math.floor(xMin) - padX);
+      const y1 = Math.max(0, Math.floor(yMin) - padY);
+      const x2 = Math.min(w, Math.ceil(xMax) + padX);
+      const y2 = Math.min(h, Math.ceil(yMax) + padY);
+
+      // Midline from nose tip (index 6), forehead (10), chin (152)
+      const noseTip  = landmarks[6];
+      const forehead = landmarks[10];
+      const chin     = landmarks[152];
+      const midX = ((noseTip.x + forehead.x + chin.x) / 3) * w;
+      const midCol = Math.max(x1 + 1, Math.min(x2 - 1, Math.round(midX)));
+
+      // Measure asymmetry
+      const asym = measureAsymmetry(imageData, x1, y1, x2, y2);
+      if (asym < 0.03) return imageData; // already symmetric enough
+
+      const maxStrength = 0.12;
+      const strength = Math.min(maxStrength, asym * 1.5);
+      const data = imageData.data;
+      const cropW = x2 - x1;
+      const cropH = y2 - y1;
+      const localMid = midCol - x1;
+      const feather = Math.max(1, Math.min(padX, padY, 20));
+
+      statusEl.textContent = "Applying symmetry correction (" + (strength * 100).toFixed(0) + "%)...";
+      await sleep(50);
+
+      // Blend each pixel with its mirror across the midline
+      for (let row = 0; row < cropH; row++) {
+        // Feather factor (fade out near edges of crop)
+        const fy = row < feather ? row / feather
+                 : row >= cropH - feather ? (cropH - 1 - row) / feather : 1;
+
+        for (let col = 0; col < cropW; col++) {
+          const fx = col < feather ? col / feather
+                   : col >= cropW - feather ? (cropW - 1 - col) / feather : 1;
+          const fade = fx * fy;
+          const s = strength * fade;
+
+          // Mirror column across midline
+          const mirrorCol = 2 * localMid - col;
+          if (mirrorCol < 0 || mirrorCol >= cropW) continue;
+
+          const iOrig   = ((y1 + row) * w + (x1 + col)) * 4;
+          const iMirror = ((y1 + row) * w + (x1 + mirrorCol)) * 4;
+
+          for (let c = 0; c < 3; c++) {
+            data[iOrig + c] = Math.round(data[iOrig + c] * (1 - s) + data[iMirror + c] * s);
+          }
+        }
+      }
+
+      return imageData;
+    } catch (e) {
+      console.warn("Face symmetry failed, skipping:", e);
+      return imageData;
+    }
+  }
+</script>
+</body>
+</html>
