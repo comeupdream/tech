@@ -104,12 +104,13 @@
 
   <div class="info">
     <strong>What this does:</strong><br>
-    1. Strips all EXIF, IPTC, XMP &amp; ICC metadata<br>
-    2. Shifts color channels by a random 1-2%<br>
-    3. Adds subtle pixel noise around the image edges<br>
-    4. Scatters a few random interior pixels by &plusmn;1<br>
-    5. Re-encodes as JPEG with randomized quality<br><br>
-    The result looks identical to the human eye but produces a completely different file hash, perceptual hash, and metadata fingerprint.
+    1. Subtle facial symmetry correction (only if needed, 10-15% max)<br>
+    2. Strips all EXIF, IPTC, XMP &amp; ICC metadata<br>
+    3. Shifts color channels by a random 1-2%<br>
+    4. Adds subtle pixel noise around the image edges<br>
+    5. Scatters a few random interior pixels by &plusmn;1<br>
+    6. Re-encodes as JPEG with randomized quality<br><br>
+    The result looks identical to the human eye but produces a completely different file hash, perceptual hash, and metadata fingerprint. Face symmetry is only adjusted when asymmetry is detected &mdash; already-symmetric faces are left alone.
   </div>
 
 <script>
