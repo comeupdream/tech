@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Photo Scrambler</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0f0f0f;
+    color: #e0e0e0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 40px 20px;
+  }
+  h1 {
+    font-size: 28px;
+    margin-bottom: 8px;
+  }
+  .subtitle {
+    color: #888;
+    margin-bottom: 32px;
+    font-size: 14px;
+  }
+  .drop-zone {
+    width: 100%;
+    max-width: 500px;
+    border: 2px dashed #444;
+    border-radius: 16px;
+    padding: 60px 20px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.2s, background 0.2s;
+  }
+  .drop-zone:hover, .drop-zone.dragover {
+    border-color: #7c6ef0;
+    background: rgba(124, 110, 240, 0.05);
+  }
+  .drop-zone p { font-size: 16px; margin-bottom: 8px; }
+  .drop-zone small { color: #666; }
+  .preview-area {
+    margin-top: 24px;
+    width: 100%;
+    max-width: 500px;
+  }
+  .preview-area img {
+    width: 100%;
+    border-radius: 12px;
+    margin-top: 12px;
+  }
+  .btn {
+    display: inline-block;
+    margin-top: 16px;
+    padding: 12px 28px;
+    background: #7c6ef0;
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    font-size: 15px;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+  .btn:hover { background: #6558d4; }
+  .btn:disabled { background: #333; cursor: not-allowed; }
+  .status {
+    margin-top: 12px;
+    font-size: 13px;
+    color: #888;
+    min-height: 20px;
+  }
+  .info {
+    margin-top: 40px;
+    max-width: 500px;
+    background: #1a1a1a;
+    border-radius: 12px;
+    padding: 20px;
+    font-size: 13px;
+    line-height: 1.6;
+    color: #999;
+  }
+  .info strong { color: #ccc; }
+  #fileInput { display: none; }
+</style>
+</head>
+<body>
+  <h1>Photo Scrambler</h1>
+  <p class="subtitle">Strip metadata &amp; subtly alter pixels to make photos unique</p>
+
+  <div class="drop-zone" id="dropZone">
+    <p>Drop a photo here or click to browse</p>
+    <small>JPG, PNG, WEBP &mdash; up to 50 MB</small>
+  </div>
+  <input type="file" id="fileInput" accept="image/*">
+
+  <div class="preview-area" id="previewArea" style="display:none;">
+    <strong>Original:</strong>
+    <img id="previewImg" alt="preview">
+    <button class="btn" id="scrambleBtn">Scramble &amp; Download</button>
+    <div class="status" id="status"></div>
+  </div>
+
+  <div class="info">
+    <strong>What this does:</strong><br>
+    1. Strips all EXIF, IPTC, XMP &amp; ICC metadata<br>
+    2. Shifts color channels by a random 1-2%<br>
+    3. Adds subtle pixel noise around the image edges<br>
+    4. Scatters a few random interior pixels by &plusmn;1<br>
+    5. Re-encodes as JPEG with randomized quality<br><br>
+    The result looks identical to the human eye but produces a completely different file hash, perceptual hash, and metadata fingerprint.
+  </div>
+
+<script>
+const dropZone = document.getElementById("dropZone");
+const fileInput = document.getElementById("fileInput");
+const previewArea = document.getElementById("previewArea");
+const previewImg = document.getElementById("previewImg");
+const scrambleBtn = document.getElementById("scrambleBtn");
+const status = document.getElementById("status");
+
+let selectedFile = null;
+
+dropZone.addEventListener("click", () => fileInput.click());
+dropZone.addEventListener("dragover", e => { e.preventDefault(); dropZone.classList.add("dragover"); });
+dropZone.addEventListener("dragleave", () => dropZone.classList.remove("dragover"));
+dropZone.addEventListener("drop", e => {
+  e.preventDefault();
+  dropZone.classList.remove("dragover");
+  if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener("change", () => { if (fileInput.files.length) handleFile(fileInput.files[0]); });
+
+function handleFile(file) {
+  if (!file.type.startsWith("image/")) { alert("Please select an image file."); return; }
+  selectedFile = file;
+  previewImg.src = URL.createObjectURL(file);
+  previewArea.style.display = "block";
+  status.textContent = `Selected: ${file.name} (${(file.size / 1024).toFixed(0)} KB)`;
+}
+
+scrambleBtn.addEventListener("click", async () => {
+  if (!selectedFile) return;
+  scrambleBtn.disabled = true;
+  status.textContent = "Scrambling...";
+
+  const form = new FormData();
+  form.append("photo", selectedFile);
+
+  try {
+    const res = await fetch("/upload", { method: "POST", body: form });
+    if (!res.ok) throw new Error(await res.text());
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = res.headers.get("Content-Disposition")?.match(/filename="?(.+?)"?$/)?.[1] || "scrambled.jpg";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    status.textContent = "Done — file downloaded!";
+  } catch (err) {
+    status.textContent = "Error: " + err.message;
+  }
+  scrambleBtn.disabled = false;
+});
+</script>
+</body>
+</html>
