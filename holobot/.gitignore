@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+audio_samples/*.wav
+audio_samples/*.mp3
+audio_samples/*.m4a
+audio_samples/*.opus
+*.egg-info/
+dist/
+build/
