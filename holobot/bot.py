@@ -1,10 +1,17 @@
-"""HoloBot — AI voice character bot for Discord.
+"""HoloBot — AI voice character bot for Discord (fully local, no paid APIs).
+
+Prerequisites:
+    1. Install Ollama: https://ollama.com
+    2. Pull a model: ollama pull llama3.1
+    3. Place a reference .wav of your character in audio_samples/reference.wav
+    4. Create a Discord bot at discord.com/developers (free)
+    5. Set DISCORD_BOT_TOKEN in .env
 
 Usage:
     python bot.py
 
 The bot responds to these slash commands:
-    /join   — Bot joins your voice channel
+    /join   — Bot joins your voice channel and starts listening
     /leave  — Bot leaves the voice channel
     /reset  — Clear conversation memory
 """
@@ -12,8 +19,10 @@ The bot responds to these slash commands:
 import asyncio
 import io
 import logging
+import shutil
+import subprocess
+import sys
 import discord
-from discord import FFmpegPCMAudio
 from discord.ext import commands
 
 import config
@@ -219,7 +228,70 @@ async def reset(ctx: discord.ApplicationContext):
 async def on_ready():
     logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
     logger.info(f"Character: {CHARACTER_NAME}")
-    logger.info("Ready to enter voice channels.")
+    logger.info("Preloading AI models (first run downloads them, may take a few minutes)...")
+
+    # Preload models in background so /join doesn't lag on first use
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _preload_models)
+    logger.info("All models loaded. Ready to enter voice channels.")
+
+
+def _preload_models():
+    """Eagerly load Whisper, Chatterbox, and Silero VAD so /join is fast."""
+    from pipeline import _get_whisper_model, _get_tts_model
+    _get_whisper_model()
+    _get_tts_model()
+
+
+def _preflight_checks():
+    """Verify everything is set up before starting."""
+    errors = []
+
+    # Discord token
+    if not config.DISCORD_BOT_TOKEN:
+        errors.append(
+            "DISCORD_BOT_TOKEN not set. Copy .env.example to .env and add your token.\n"
+            "  Get one free at: https://discord.com/developers/applications"
+        )
+
+    # Reference audio
+    from pathlib import Path
+    ref = Path(config.REFERENCE_AUDIO)
+    if not ref.exists():
+        errors.append(
+            f"Reference audio not found: {ref}\n"
+            f"  Place a ~10-30 second .wav clip of Andrew Tate speaking there.\n"
+            f"  Or run: python scraper/youtube_scraper.py  to download clips."
+        )
+
+    # Ollama running
+    try:
+        import urllib.request
+        urllib.request.urlopen(config.OLLAMA_BASE_URL.replace("/v1", ""), timeout=3)
+    except Exception:
+        errors.append(
+            f"Ollama not reachable at {config.OLLAMA_BASE_URL}\n"
+            f"  Install: https://ollama.com\n"
+            f"  Then run: ollama pull {config.OLLAMA_MODEL}\n"
+            f"  Ollama should start automatically, or run: ollama serve"
+        )
+
+    # ffmpeg (needed by py-cord for voice)
+    if not shutil.which("ffmpeg"):
+        errors.append(
+            "ffmpeg not found. Install it:\n"
+            "  Ubuntu/Debian: sudo apt install ffmpeg\n"
+            "  Mac: brew install ffmpeg\n"
+            "  Windows: download from https://ffmpeg.org"
+        )
+
+    if errors:
+        print("\n" + "=" * 60)
+        print("PREFLIGHT CHECK FAILED — fix these before running:\n")
+        for i, err in enumerate(errors, 1):
+            print(f"  {i}. {err}\n")
+        print("=" * 60)
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +299,5 @@ async def on_ready():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    if not config.DISCORD_BOT_TOKEN:
-        raise RuntimeError("DISCORD_BOT_TOKEN not set. Copy .env.example to .env and fill it in.")
+    _preflight_checks()
     bot.run(config.DISCORD_BOT_TOKEN)

@@ -1,13 +1,29 @@
+# Discord
 pycord[voice]>=2.6.0
+
+# Local STT (speech-to-text) — runs Whisper locally
+faster-whisper>=1.0.0
+
+# Local LLM — talks to Ollama's local API (OpenAI-compatible)
 openai>=1.50.0
-deepgram-sdk>=3.5.0
-elevenlabs>=1.5.0
+
+# Local TTS + voice cloning — Resemble AI's Chatterbox (MIT licensed)
+chatterbox-tts>=0.1.0
+
+# VAD (voice activity detection)
 silero-vad>=5.1
+
+# Audio processing
 numpy>=1.26.0
 scipy>=1.12.0
-python-dotenv>=1.0.0
-yt-dlp>=2024.1.0
-pydub>=0.25.1
-aiohttp>=3.9.0
 torch>=2.1.0
 torchaudio>=2.1.0
+pydub>=0.25.1
+soundfile>=0.12.0
+
+# Utilities
+python-dotenv>=1.0.0
+aiohttp>=3.9.0
+
+# Scraper (for downloading reference voice clips)
+yt-dlp>=2024.1.0

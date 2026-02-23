@@ -1,27 +1,34 @@
 """Scrape YouTube videos for voice reference samples.
 
-Downloads audio from YouTube videos/playlists, extracts clean vocal segments,
-and prepares them for ElevenLabs voice cloning.
+Downloads audio from YouTube videos, extracts clean vocal segments,
+and prepares a reference.wav for Chatterbox voice cloning.
 
 Usage:
+    # Download specific videos
     python scraper/youtube_scraper.py --urls URL1 URL2 ...
+
+    # Search and download
     python scraper/youtube_scraper.py --search "Andrew Tate interview" --max-results 5
+
+    # Download, split into 30s segments, and auto-pick the best one
     python scraper/youtube_scraper.py --urls URL1 --split-segments --segment-length 30
 
-ElevenLabs voice cloning tips:
-    - Upload 1-30 minutes of CLEAN speech (no music, no other speakers)
-    - Consistent audio quality across samples
-    - Variety of tones/emotions helps (calm, energetic, laughing, serious)
-    - Remove background noise and music before uploading
+Chatterbox voice cloning tips:
+    - Only needs ONE clean clip of ~10-30 seconds
+    - Single speaker only (no music, no other people talking)
+    - Clear audio quality, minimal background noise
+    - The scraper creates a reference.wav automatically from the best segment
 """
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 OUTPUT_DIR = Path(__file__).parent.parent / "audio_samples"
+REFERENCE_FILE = OUTPUT_DIR / "reference.wav"
 
 
 def download_audio(url: str, output_dir: Path, prefix: str = "sample") -> Path | None:
@@ -34,7 +41,8 @@ def download_audio(url: str, output_dir: Path, prefix: str = "sample") -> Path |
         "--extract-audio",
         "--audio-format", "wav",
         "--audio-quality", "0",
-        "--postprocessor-args", "-ar 24000 -ac 1",  # 24kHz mono for ElevenLabs
+        # 24kHz mono — Chatterbox's native sample rate
+        "--postprocessor-args", "-ar 24000 -ac 1",
         "--output", output_template,
         "--no-playlist",
         url,
@@ -117,6 +125,30 @@ def split_audio(input_path: Path, segment_length: int, output_dir: Path) -> list
     return segments
 
 
+def extract_reference(input_path: Path, output_path: Path, start: float = 0, duration: float = 25):
+    """Extract a clean reference clip from a longer audio file.
+    Chatterbox works best with 10-30 seconds of clean speech."""
+    cmd = [
+        "ffmpeg",
+        "-i", str(input_path),
+        "-ss", str(start),
+        "-t", str(duration),
+        "-ar", "24000", "-ac", "1",
+        "-c:a", "pcm_s16le",
+        str(output_path),
+        "-y",
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Extract failed: {result.stderr[:200]}")
+        return False
+
+    size_kb = output_path.stat().st_size / 1024
+    print(f"  Reference clip: {output_path} ({size_kb:.0f} KB, {duration}s)")
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description="Download YouTube audio for voice cloning")
     parser.add_argument("--urls", nargs="+", help="YouTube URLs to download")
@@ -125,10 +157,26 @@ def main():
     parser.add_argument("--output-dir", type=str, default=str(OUTPUT_DIR))
     parser.add_argument("--split-segments", action="store_true", help="Split into segments")
     parser.add_argument("--segment-length", type=int, default=30, help="Segment length in seconds")
+    parser.add_argument(
+        "--ref-start", type=float, default=10,
+        help="Start time (seconds) for reference clip extraction (skip intros)"
+    )
+    parser.add_argument(
+        "--ref-duration", type=float, default=25,
+        help="Duration (seconds) of the reference clip"
+    )
 
     args = parser.parse_args()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check dependencies
+    if not shutil.which("yt-dlp"):
+        print("ERROR: yt-dlp not found. Install it: pip install yt-dlp")
+        sys.exit(1)
+    if not shutil.which("ffmpeg"):
+        print("ERROR: ffmpeg not found. Install it: sudo apt install ffmpeg")
+        sys.exit(1)
 
     downloaded = []
 
@@ -159,13 +207,29 @@ def main():
             all_segments.extend(segments)
         print(f"\nTotal segments: {len(all_segments)}")
 
-    print(f"\n{'='*50}")
+    # Auto-create reference.wav from the first download
+    if downloaded and not REFERENCE_FILE.exists():
+        print(f"\nCreating reference clip for Chatterbox voice cloning...")
+        extract_reference(
+            downloaded[0], REFERENCE_FILE,
+            start=args.ref_start, duration=args.ref_duration
+        )
+
+    print(f"\n{'='*60}")
     print(f"Downloaded {len(downloaded)} audio files to: {output_dir}")
+    if REFERENCE_FILE.exists():
+        print(f"\nReference audio ready: {REFERENCE_FILE}")
+        print(f"  Chatterbox will use this to clone the voice.")
+        print(f"  Listen to it — if the audio quality is bad or has")
+        print(f"  other speakers, replace it with a cleaner clip.")
     print(f"\nNext steps:")
-    print(f"  1. Listen to the files and remove any with music/other speakers")
-    print(f"  2. Go to https://elevenlabs.io/voice-cloning")
-    print(f"  3. Upload the clean audio files to create a cloned voice")
-    print(f"  4. Copy the Voice ID and set ELEVENLABS_VOICE_ID in your .env file")
+    print(f"  1. Listen to audio_samples/reference.wav")
+    print(f"     - Should be ~10-30s of ONLY the target speaking")
+    print(f"     - No music, no other voices, clear audio")
+    print(f"  2. If it's not clean, manually pick a better segment:")
+    print(f"     python scraper/youtube_scraper.py --urls YOUR_URL --ref-start 45 --ref-duration 25")
+    print(f"  3. Run the bot: python bot.py")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":

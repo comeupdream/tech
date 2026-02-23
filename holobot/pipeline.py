@@ -1,30 +1,50 @@
 """Voice processing pipeline: VAD → STT → LLM → TTS.
 
-Takes raw PCM audio from Discord, detects speech, transcribes it,
-generates an in-character response, and synthesizes speech audio.
+Fully local — no paid APIs, no signups, no cloud calls.
+
+  STT:  faster-whisper  (runs Whisper locally)
+  LLM:  Ollama          (runs Llama/Mistral locally)
+  TTS:  Chatterbox      (zero-shot voice clone, MIT licensed)
+  VAD:  Silero          (speech boundary detection)
 """
 
 import asyncio
 import io
-import struct
 import logging
 import time
 from collections import deque
+from pathlib import Path
 
 import numpy as np
 import torch
+import torchaudio
 from scipy.signal import resample_poly
 from openai import AsyncOpenAI
-from deepgram import DeepgramClient, PrerecordedOptions
-from elevenlabs import AsyncElevenLabs
 
 import config
 from personality import SYSTEM_PROMPT, FALLBACK_RESPONSE
 
 logger = logging.getLogger("holobot.pipeline")
 
+
 # ---------------------------------------------------------------------------
-# VAD — Silero Voice Activity Detection
+# Device helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_device(setting: str) -> str:
+    if setting == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return setting
+
+
+def _resolve_compute_type(setting: str) -> str:
+    if setting == "auto":
+        return "float16" if torch.cuda.is_available() else "int8"
+    return setting
+
+
+# ---------------------------------------------------------------------------
+# VAD — Silero Voice Activity Detection (local)
 # ---------------------------------------------------------------------------
 
 class VoiceActivityDetector:
@@ -75,7 +95,7 @@ class VoiceActivityDetector:
 
                 if self._silence_counter >= self.silence_samples:
                     utterance = bytes(self._speech_buffer)
-                    total_samples = len(utterance) // 2  # 16-bit = 2 bytes per sample
+                    total_samples = len(utterance) // 2  # 16-bit = 2 bytes/sample
                     self.reset()
                     if total_samples >= self.min_speech_samples:
                         return utterance
@@ -104,47 +124,72 @@ def discord_pcm_to_16k_mono(pcm_48k_stereo: bytes) -> bytes:
     return resampled.tobytes()
 
 
-def pcm_to_wav_bytes(pcm_data: bytes, sample_rate: int = 16000, channels: int = 1) -> bytes:
-    """Wrap raw PCM16 in a WAV header for APIs that expect WAV input."""
-    import wave
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(channels)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(pcm_data)
-    return buf.getvalue()
+def pcm16k_to_float32(pcm_data: bytes) -> np.ndarray:
+    """Convert 16kHz mono PCM16 bytes to float32 numpy array [-1.0, 1.0]."""
+    return np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def audio_to_discord_pcm(audio_tensor: torch.Tensor, source_sr: int) -> bytes:
+    """Convert a torch audio tensor to Discord-ready 48kHz stereo PCM16 bytes."""
+    # Ensure mono
+    if audio_tensor.dim() > 1:
+        audio_tensor = audio_tensor.mean(dim=0, keepdim=True)
+    if audio_tensor.dim() == 1:
+        audio_tensor = audio_tensor.unsqueeze(0)
+
+    # Resample to 48kHz
+    if source_sr != config.DISCORD_SAMPLE_RATE:
+        audio_tensor = torchaudio.functional.resample(
+            audio_tensor, source_sr, config.DISCORD_SAMPLE_RATE
+        )
+
+    # Float → int16
+    samples = (audio_tensor.squeeze().clamp(-1.0, 1.0) * 32767).to(torch.int16).numpy()
+
+    # Mono → stereo (duplicate channel)
+    stereo = np.column_stack([samples, samples]).flatten().astype(np.int16)
+    return stereo.tobytes()
 
 
 # ---------------------------------------------------------------------------
-# STT — Deepgram transcription
+# STT — faster-whisper (local, no API key)
 # ---------------------------------------------------------------------------
+
+_whisper_model = None
+
+
+def _get_whisper_model():
+    """Lazy-load the Whisper model (takes a few seconds on first call)."""
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+        device = _resolve_device(config.WHISPER_DEVICE)
+        compute = _resolve_compute_type(config.WHISPER_COMPUTE_TYPE)
+        logger.info(f"Loading Whisper model '{config.WHISPER_MODEL}' on {device} ({compute})")
+        _whisper_model = WhisperModel(
+            config.WHISPER_MODEL, device=device, compute_type=compute
+        )
+        logger.info("Whisper model loaded.")
+    return _whisper_model
+
 
 async def transcribe(pcm_16k_mono: bytes) -> str:
-    """Transcribe a PCM16 audio utterance to text using Deepgram."""
-    client = DeepgramClient(config.DEEPGRAM_API_KEY)
-    wav_data = pcm_to_wav_bytes(pcm_16k_mono)
+    """Transcribe a PCM16 audio utterance to text using local Whisper."""
+    audio_float = pcm16k_to_float32(pcm_16k_mono)
+    model = _get_whisper_model()
 
-    options = PrerecordedOptions(
-        model="nova-2",
-        language="en",
-        smart_format=True,
+    # faster-whisper is synchronous, so run in a thread
+    segments, info = await asyncio.to_thread(
+        model.transcribe, audio_float, language="en", beam_size=3
     )
-
-    source = {"buffer": wav_data, "mimetype": "audio/wav"}
-    response = await asyncio.to_thread(
-        client.listen.rest.v("1").transcribe_file, source, options
-    )
-
-    transcript = (
-        response.results.channels[0].alternatives[0].transcript
-    )
+    # Collect all segment texts
+    transcript = " ".join(seg.text.strip() for seg in segments)
     logger.info(f"STT: {transcript}")
     return transcript.strip()
 
 
 # ---------------------------------------------------------------------------
-# LLM — Character response generation
+# LLM — Ollama via OpenAI-compatible API (local, no API key)
 # ---------------------------------------------------------------------------
 
 class ConversationMemory:
@@ -164,16 +209,23 @@ class ConversationMemory:
         return [{"role": "system", "content": SYSTEM_PROMPT}] + list(self.messages)
 
 
-async def generate_response(memory: ConversationMemory, user_text: str, speaker: str = "Someone") -> str:
-    """Generate an in-character response from the LLM."""
+async def generate_response(
+    memory: ConversationMemory, user_text: str, speaker: str = "Someone"
+) -> str:
+    """Generate an in-character response from the local LLM via Ollama."""
     if not user_text or len(user_text) < 3:
         return FALLBACK_RESPONSE
 
     memory.add_user(user_text, speaker)
 
-    client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
+    # Ollama serves an OpenAI-compatible API — we just point the client at localhost
+    client = AsyncOpenAI(
+        base_url=config.OLLAMA_BASE_URL,
+        api_key="ollama",  # Ollama doesn't need a real key but the client requires one
+    )
+
     response = await client.chat.completions.create(
-        model=config.LLM_MODEL,
+        model=config.OLLAMA_MODEL,
         messages=memory.get_messages(),
         max_tokens=config.LLM_MAX_TOKENS,
         temperature=config.LLM_TEMPERATURE,
@@ -186,35 +238,60 @@ async def generate_response(memory: ConversationMemory, user_text: str, speaker:
 
 
 # ---------------------------------------------------------------------------
-# TTS — ElevenLabs text-to-speech with cloned voice
+# TTS — Chatterbox by Resemble AI (local, MIT licensed, zero-shot voice clone)
 # ---------------------------------------------------------------------------
 
-async def synthesize_speech(text: str) -> bytes:
-    """Convert text to speech using ElevenLabs with the cloned voice.
-    Returns raw PCM16 48kHz stereo bytes ready for Discord playback."""
-    client = AsyncElevenLabs(api_key=config.ELEVENLABS_API_KEY)
+_tts_model = None
+_reference_audio = None
 
-    # Generate audio — ElevenLabs returns mp3 by default
-    audio_iterator = await client.text_to_speech.convert(
-        voice_id=config.ELEVENLABS_VOICE_ID,
-        text=text,
-        model_id=config.TTS_MODEL,
-        output_format="pcm_24000",  # raw PCM 24kHz mono
+
+def _get_tts_model():
+    """Lazy-load the Chatterbox TTS model."""
+    global _tts_model
+    if _tts_model is None:
+        from chatterbox.tts import ChatterboxTTS
+        device = _resolve_device(config.CHATTERBOX_DEVICE)
+        logger.info(f"Loading Chatterbox TTS on {device}...")
+        _tts_model = ChatterboxTTS.from_pretrained(device=device)
+        logger.info("Chatterbox TTS loaded.")
+    return _tts_model
+
+
+def _get_reference_audio() -> str:
+    """Get the path to the reference audio file for voice cloning."""
+    global _reference_audio
+    if _reference_audio is None:
+        ref_path = Path(config.REFERENCE_AUDIO)
+        if not ref_path.exists():
+            raise FileNotFoundError(
+                f"Reference audio not found at {ref_path}\n"
+                f"Place a ~10-30 second .wav clip of Andrew Tate speaking at:\n"
+                f"  {ref_path}\n"
+                f"Or set REFERENCE_AUDIO in .env to point to your clip."
+            )
+        _reference_audio = str(ref_path)
+        logger.info(f"Using reference audio: {_reference_audio}")
+    return _reference_audio
+
+
+async def synthesize_speech(text: str) -> bytes:
+    """Convert text to speech using Chatterbox with zero-shot voice cloning.
+    Returns raw PCM16 48kHz stereo bytes ready for Discord playback."""
+    model = _get_tts_model()
+    ref_audio = _get_reference_audio()
+
+    # Chatterbox generate is synchronous + GPU-bound, run in thread
+    wav_tensor = await asyncio.to_thread(
+        model.generate,
+        text,
+        audio_prompt_path=ref_audio,
+        exaggeration=config.CHATTERBOX_EXAGGERATION,
+        cfg_weight=config.CHATTERBOX_CFG_WEIGHT,
     )
 
-    # Collect all chunks
-    pcm_24k = bytearray()
-    async for chunk in audio_iterator:
-        pcm_24k.extend(chunk)
-
-    pcm_24k = bytes(pcm_24k)
-
-    # Convert 24kHz mono → 48kHz stereo for Discord
-    samples = np.frombuffer(pcm_24k, dtype=np.int16).astype(np.float32)
-    upsampled = resample_poly(samples, up=2, down=1).astype(np.int16)
-    # Mono to stereo — duplicate the channel
-    stereo = np.column_stack([upsampled, upsampled]).flatten()
-    pcm_48k_stereo = stereo.astype(np.int16).tobytes()
+    # Chatterbox outputs at its own sample rate (usually 24kHz)
+    source_sr = model.sr
+    pcm_48k_stereo = audio_to_discord_pcm(wav_tensor, source_sr)
 
     logger.info(f"TTS: synthesized {len(pcm_48k_stereo)} bytes of audio")
     return pcm_48k_stereo
@@ -232,15 +309,15 @@ async def process_utterance(
     """Full pipeline: transcribe → think → speak. Returns Discord-ready PCM audio."""
     start = time.monotonic()
 
-    # 1. STT
+    # 1. STT — local Whisper
     transcript = await transcribe(pcm_16k_mono)
     if not transcript:
         return await synthesize_speech(FALLBACK_RESPONSE)
 
-    # 2. LLM
+    # 2. LLM — local Ollama
     reply_text = await generate_response(memory, transcript, speaker)
 
-    # 3. TTS
+    # 3. TTS — local Chatterbox
     audio_out = await synthesize_speech(reply_text)
 
     elapsed = time.monotonic() - start
