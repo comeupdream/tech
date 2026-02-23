@@ -44,11 +44,21 @@ WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "auto")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "auto")
 
 # ---------------------------------------------------------------------------
-# LLM — Ollama (local)
+# LLM — llama-cpp-python (local, auto-downloads model on first run)
 # ---------------------------------------------------------------------------
-# Install: https://ollama.com then run: ollama pull llama3.1
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
+# HuggingFace repo and filename for the GGUF model
+# Default: Llama 3.1 8B Instruct (Q4_K_M quantization, ~4.7GB download once)
+LLM_REPO_ID = os.getenv(
+    "LLM_REPO_ID", "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF"
+)
+LLM_MODEL_FILE = os.getenv(
+    "LLM_MODEL_FILE", "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+)
+# Context window (how much conversation history to keep)
+LLM_CONTEXT_SIZE = int(os.getenv("LLM_CONTEXT_SIZE", "4096"))
+# GPU layers: -1 = offload everything to GPU, 0 = CPU only
+# Auto-detected: uses GPU if available, otherwise CPU
+LLM_GPU_LAYERS = int(os.getenv("LLM_GPU_LAYERS", "-1"))
 LLM_MAX_TOKENS = 300          # keep responses punchy
 LLM_TEMPERATURE = 0.9         # creative flair
 

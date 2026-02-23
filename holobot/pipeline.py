@@ -1,12 +1,14 @@
 """Voice processing pipeline: VAD → STT → LLM → TTS.
 
-Fully local — no APIs, no signups, no cloud calls.
-Talks to your mic and speakers directly.
+Fully local — no APIs, no signups, no cloud calls, no extra installs.
+Everything runs in this Python process.
 
-  STT:  faster-whisper  (runs Whisper locally)
-  LLM:  Ollama          (runs Llama/Mistral locally)
-  TTS:  Chatterbox      (zero-shot voice clone, MIT licensed)
-  VAD:  Silero          (speech boundary detection)
+  STT:  faster-whisper    (runs Whisper locally)
+  LLM:  llama-cpp-python  (runs Llama 3.1 directly in Python)
+  TTS:  Chatterbox        (zero-shot voice clone, MIT licensed)
+  VAD:  Silero            (speech boundary detection)
+
+Models auto-download from HuggingFace on first run.
 """
 
 import asyncio
@@ -17,7 +19,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from openai import AsyncOpenAI
 
 import config
 from personality import SYSTEM_PROMPT, FALLBACK_RESPONSE
@@ -137,8 +138,38 @@ async def transcribe(pcm_16k_mono: bytes) -> str:
 
 
 # ---------------------------------------------------------------------------
-# LLM — Ollama (local)
+# LLM — llama-cpp-python (local, auto-downloads model from HuggingFace)
 # ---------------------------------------------------------------------------
+
+_llm = None
+
+
+def _get_llm():
+    """Lazy-load the LLM. Downloads the model file on first run (~4.7GB once)."""
+    global _llm
+    if _llm is None:
+        from llama_cpp import Llama
+
+        gpu_layers = config.LLM_GPU_LAYERS
+        if gpu_layers == -1 and not torch.cuda.is_available():
+            gpu_layers = 0  # CPU fallback
+
+        logger.info(
+            f"Loading LLM: {config.LLM_REPO_ID} / {config.LLM_MODEL_FILE} "
+            f"(GPU layers: {gpu_layers})..."
+        )
+        logger.info("(First run downloads the model from HuggingFace — one time only)")
+
+        _llm = Llama.from_pretrained(
+            repo_id=config.LLM_REPO_ID,
+            filename=config.LLM_MODEL_FILE,
+            n_ctx=config.LLM_CONTEXT_SIZE,
+            n_gpu_layers=gpu_layers,
+            verbose=False,
+        )
+        logger.info("LLM loaded.")
+    return _llm
+
 
 class ConversationMemory:
     """Rolling conversation history."""
@@ -162,20 +193,17 @@ async def generate_response(memory: ConversationMemory, user_text: str) -> str:
         return FALLBACK_RESPONSE
 
     memory.add_user(user_text)
+    llm = _get_llm()
 
-    client = AsyncOpenAI(
-        base_url=config.OLLAMA_BASE_URL,
-        api_key="ollama",
-    )
-
-    response = await client.chat.completions.create(
-        model=config.OLLAMA_MODEL,
+    # llama-cpp-python's chat completion is synchronous — run in thread
+    response = await asyncio.to_thread(
+        llm.create_chat_completion,
         messages=memory.get_messages(),
         max_tokens=config.LLM_MAX_TOKENS,
         temperature=config.LLM_TEMPERATURE,
     )
 
-    reply = response.choices[0].message.content.strip()
+    reply = response["choices"][0]["message"]["content"].strip()
     memory.add_assistant(reply)
     logger.info(f"LLM: {reply}")
     return reply

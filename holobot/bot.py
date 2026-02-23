@@ -1,24 +1,21 @@
 """HoloBot — Talk to an AI voice clone through your mic and speakers.
 
-No accounts. No APIs. No Discord. Just run it and talk.
+No accounts. No APIs. No extra installs. Just pip install and run.
 
-Prerequisites:
-    1. Install Ollama: https://ollama.com
-    2. Pull a model:   ollama pull llama3.1
-    3. Place a ~10-30s reference .wav in audio_samples/reference.wav
-    4. pip install -r requirements.txt
-    5. python bot.py
+Setup:
+    1. pip install -r requirements.txt
+    2. Drop a ~10-30s .wav of your target voice in audio_samples/reference.wav
+    3. python bot.py
+
+That's it. Models auto-download on first run.
 
 Controls:
     Ctrl+C  — Quit
-    r       — Reset conversation memory (type in terminal while running)
 """
 
 import asyncio
 import logging
-import shutil
 import sys
-import threading
 from pathlib import Path
 
 import numpy as np
@@ -33,6 +30,7 @@ from pipeline import (
     get_tts_sample_rate,
     _get_whisper_model,
     _get_tts_model,
+    _get_llm,
 )
 from personality import CHARACTER_NAME, GREETING
 
@@ -51,7 +49,7 @@ logger = logging.getLogger("holobot")
 # ---------------------------------------------------------------------------
 
 def preflight_checks():
-    """Make sure everything is set up before starting."""
+    """Make sure the basics are in place before loading models."""
     errors = []
 
     # Reference audio
@@ -63,23 +61,8 @@ def preflight_checks():
             f"  Or run: python scraper/youtube_scraper.py"
         )
 
-    # Ollama running
-    try:
-        import urllib.request
-        urllib.request.urlopen(
-            config.OLLAMA_BASE_URL.replace("/v1", ""), timeout=3
-        )
-    except Exception:
-        errors.append(
-            f"Ollama not reachable at {config.OLLAMA_BASE_URL}\n"
-            f"  Install: https://ollama.com\n"
-            f"  Then run: ollama pull {config.OLLAMA_MODEL}\n"
-            f"  Start it: ollama serve"
-        )
-
     # Microphone available
     try:
-        devices = sd.query_devices()
         input_device = sd.query_devices(kind="input")
         logger.info(f"Mic: {input_device['name']}")
     except Exception:
@@ -103,7 +86,6 @@ def preflight_checks():
 
 def play_audio(audio_np: np.ndarray, sample_rate: int):
     """Play a numpy float32 audio array through the speakers. Blocks until done."""
-    # Clamp to [-1, 1] to avoid clipping distortion
     audio_np = np.clip(audio_np, -1.0, 1.0)
     sd.play(audio_np, samplerate=sample_rate)
     sd.wait()
@@ -137,7 +119,7 @@ async def conversation_loop():
 
     while True:
         try:
-            # Record one chunk from the mic (blocking, but it's only 30ms)
+            # Record one chunk from the mic (blocking, but only 30ms)
             audio_chunk = sd.rec(
                 chunk_samples,
                 samplerate=config.MIC_SAMPLE_RATE,
@@ -151,11 +133,10 @@ async def conversation_loop():
             utterance = vad.process_chunk(pcm_bytes)
 
             if utterance is not None:
-                # Got a complete utterance — process it
                 print("  [heard you, thinking...]")
                 response_audio = await process_utterance(utterance, memory)
 
-                print(f"  [speaking...]")
+                print("  [speaking...]")
                 play_audio(response_audio, tts_sr)
                 print("  [listening...]\n")
 
@@ -171,16 +152,24 @@ async def conversation_loop():
 # ---------------------------------------------------------------------------
 
 def preload_models():
-    """Load all AI models upfront so the first response is fast."""
-    print("Loading AI models (first run downloads them, may take a few minutes)...")
-    print("  - Whisper (speech recognition)...")
+    """Load all AI models upfront so the first response is fast.
+    First run auto-downloads everything (~5-6GB total, one time only)."""
+    print("Loading AI models...")
+    print("(First run downloads them automatically — one time only)\n")
+
+    print("  [1/4] Whisper (speech recognition)...")
     _get_whisper_model()
-    print("  - Chatterbox (voice cloning)...")
+
+    print("  [2/4] Llama 3.1 (AI brain)...")
+    _get_llm()
+
+    print("  [3/4] Chatterbox (voice cloning)...")
     _get_tts_model()
-    print("  - Silero VAD (voice detection)... ", end="")
+
+    print("  [4/4] Silero VAD (voice detection)...")
     VoiceActivityDetector()
-    print("done")
-    print("All models loaded.\n")
+
+    print("\nAll models loaded. Ready to talk.\n")
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +178,7 @@ def preload_models():
 
 def main():
     print(f"\n  HoloBot — Talk to {CHARACTER_NAME}")
-    print(f"  100% local. No accounts. No APIs.\n")
+    print(f"  100% local. No accounts. No APIs. No extra installs.\n")
 
     preflight_checks()
     preload_models()

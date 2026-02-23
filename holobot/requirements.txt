@@ -1,8 +1,9 @@
 # Local STT (speech-to-text) — runs Whisper locally
 faster-whisper>=1.0.0
 
-# Local LLM — talks to Ollama's local API (OpenAI-compatible)
-openai>=1.50.0
+# Local LLM — runs Llama directly in Python, auto-downloads model on first run
+llama-cpp-python>=0.3.0
+huggingface-hub>=0.24.0
 
 # Local TTS + voice cloning — Resemble AI's Chatterbox (MIT licensed)
 chatterbox-tts>=0.1.0
